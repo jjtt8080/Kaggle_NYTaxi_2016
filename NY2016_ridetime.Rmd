@@ -1,0 +1,434 @@
+---
+title: "New York Taxi Ride Time Prediction"
+output: github_document
+    html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(leaflet)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(stats)
+library(lubridate)
+library(plotly)
+library(geosphere)
+library(pracma)
+library(MASS)
+library(Metrics)
+library(VGAM)
+library(rpart)
+library(xgboost)
+library(Matrix)
+```
+
+# Executative Summary : New York Taxi Trip Time Prediction
+
+The dataset is obtained from  the 2016 NYC Yellow Cab trip record data made available in Big Query on Google Cloud Platform. The data was originally published by the NYC Taxi and Limousine Commission (TLC). This report will be demostrating on the taxi trip time prediction from the following predictors : Pickup location, Drop Of Location, and Pickup Datetime. 
+
+
+## Exploratory Data Analysis
+
+We have done some exploratory data analysis in the previous report <a href="https://jjtt8080.neocities.org/Data%20Science%20Projects/New%20York%20Taxi%202016/ny_taxi_popular_pickup.html"> New York Taxi Popular Pickup Location Map</a>.
+
+We will continue to massage the data in a different way in order to predict the trip time of taxi ride. 
+
+```{r unzip_data, cache=TRUE, echo=TRUE, warning=FALSE}
+# The URL to download the train.zip is from the kaggle website: 
+# website:https://www.kaggle.com/c/nyc-taxi-trip-duration/data/
+unzip("train.zip")
+trainDS<-c()
+if (file.exists("train.bin"))
+{
+    trainDS<-readRDS("train.bin")
+} else {
+    if (file.exists("train.csv"))
+    {
+        trainDS<-read.table("train.csv", header=TRUE, sep=",")
+        saveRDS(trainDS, file="train.bin")
+    }
+}
+if (file.exists("test.bin"))
+{
+    testDS <- readRDS("test.bin")
+    
+} else {
+    if (file.exists("test.csv"))
+    {
+        testDS <-read.table("test.csv", header=TRUE,sep=",")
+        saveRDS(testDS, file="test.bin")
+    }
+}
+names(trainDS)    
+names(testDS)
+testDS$trip_duration <- NA
+testDS$dropoff_datetime <- NA
+trainDS <- trainDS %>% 
+    filter(is.na(dropoff_datetime)==FALSE)  %>%
+    filter(trip_duration < 24*60*60)
+    
+allDS <- rbind(trainDS, testDS)
+rm(testDS)
+rm(trainDS)
+gc()
+```
+
+   We will select the following columns: pickup_longitude, pickup_latitude, dropoff_longitude, dropoff_latitude, pickup_datetime, dropof_datetime as the input variables, and the trip_duration will be our outcome variable. 
+   
+   In order to translate the geospatial data more accurately, we will be adding some new columns:
+    1. Trip Distance: We calculate the trip distance via the distance between pickup / drop off location using the geosphere library (distGeo function), we will update the dataset with an additional column named "trip_distance" stored the distance in meters.
+    2. Trip bearing / haversing. It's showing the trip's arc distance and direction of two geo points.
+    
+    3. Pick up hour : We will derive the pickup hour from the pickup_datetime column using the hour() API.
+    4. Weekday / Weekend / holiday indicator: We will derive a factor variable (Weekday / Weekend) from the pickup_datetime column. T represent weekdays, F represent Weekends.
+    
+   
+```{r preProcessing_data}
+pickups  <- matrix(c(allDS[,6], allDS[,7]), ncol=2)
+dropoffs <- matrix(c(allDS[,8], allDS[,9]), ncol=2)
+allDS$trip_distance <- distGeo(pickups, dropoffs)
+summary(allDS$trip_distance)
+allDS$trip_bearing <- bearing(pickups, dropoffs)
+allDS$trip_haversine <- distHaversine(pickups, dropoffs)
+
+allDS <- allDS %>% 
+    filter(!is.na(pickup_datetime)) %>%
+    mutate(pickup_datetime = as.POSIXct(strptime(pickup_datetime, format="%Y-%m-%d %H:%M:%S"))) %>%
+    mutate(dropoff_datetime = as.POSIXct(strptime(dropoff_datetime, format="%Y-%m-%d %H:%M:%S"))) %>%
+    mutate(trip_hour = hour(pickup_datetime)) %>%
+    mutate(trip_wkday_ind = 
+               ifelse(weekdays(pickup_datetime) %in% c("Saturday", "Sunday"), 
+                      "F", "T")) %>% 
+    mutate(trip_date = date(pickup_datetime)) %>%
+    mutate(trip_duration_computed = as.numeric(difftime(dropoff_datetime, pickup_datetime, units="secs"))) %>%
+    mutate(trip_month=month(trip_date)) %>%
+    mutate(trip_wkday=weekdays(trip_date, abbreviate=TRUE))
+    
+
+summary(allDS$trip_duration)         
+summary(allDS$trip_hour)
+summary(allDS$trip_wkday_ind)           
+summary(allDS$trip_speed)
+```
+
+### Additional predictor for Pick up / drop off location 
+When dealing with the popular pickup location map <a href="https://jjtt8080.neocities.org/Data%20Science%20Projects/New%20York%20Taxi%202016/ny_taxi_popular_pickup.html">, we found there are some popular pick up location that's near suburb area like airport. Most of the pickup locations are near Mahattan. We wonder if those pickup/drop off location will affect the speed since the airport is usually off suburburn and the driving speed usually is greater. We will use kmeans to find the clustered pickup/drop off location and add two more additional column named pickup_cluster_id, dropoff_cluster_id as additional predictors.
+
+```{r pickup_dropoff_center}
+set.seed(7553)
+pickupKMS <- kmeans(cbind(allDS$pickup_longitude, allDS$pickup_latitude), centers=10)
+dropKMS <- kmeans(cbind(allDS$dropoff_longitude, allDS$dropoff_latitude), centers=10)
+allDS$trip_pickup_cluster <-pickupKMS$cluster
+allDS$trip_dropoff_cluster <- dropKMS$cluster
+
+pickupCenters <- as.data.frame(as.matrix(pickupKMS$centers, ncol=2))
+pickupCenters$cnt <- pickupKMS$size
+names(pickupCenters) <- c("lng", "lat", "cnt")
+dropoffCenters <- as.data.frame(as.matrix(dropKMS$centers, ncol=2))
+dropoffCenters$cnt <- dropKMS$size
+names(dropoffCenters) <- c("lng", "lat", "cnt")
+
+leaflet(pickupCenters) %>%
+    addTiles() %>%
+    setView(lng=-73.99234, lat=40.74488, zoom=10) %>%
+    addCircleMarkers(lng=~lng, lat=~lat,
+               popup=as.character(pickupCenters$cnt),
+               radius=~cnt,
+               clusterOptions = markerClusterOptions())
+    
+```
+### Traffic aggregation for month and weekday
+Some month might have snow fall and resulted in long pickup time. We will add the month as well.
+
+
+```{r pickup_month}
+
+aggrMonthDS <- allDS %>%
+     filter(!is.na(trip_duration)) %>%
+     group_by(trip_month) %>%
+     summarise_at(vars(trip_duration), mean)
+plot_ly(aggrMonthDS, x=~trip_month, y=~trip_duration, type="scatter", mode="markers+lines")
+```
+
+Additionally, we also categorize the trip_hour and found that the speed has been drastically reduced in traffic hour (hour 8 am to 7 pm), while the speed seems to be the highest in midnight (hour 1 to 4). 
+
+```{R hour_and_weekday_indicator, echo=TRUE}
+aggrHourDS <-allDS %>%
+    filter(!is.na(trip_duration)) %>%
+    group_by(trip_hour) %>%
+    summarise_at(vars(trip_duration), mean)
+hourPlot <- ggplot(data=aggrHourDS, aes(x=trip_hour, y=trip_duration)) +
+    geom_point() + 
+    geom_line()
+
+
+weekdayDS <- allDS %>%
+    filter(!is.na(trip_duration)) %>%
+    group_by(trip_wkday) %>%
+    summarise_at(vars(trip_duration), mean)
+weekdayPlot <- ggplot(data=weekdayDS, aes(x=trip_wkday, y=trip_duration))+
+    geom_point() +
+    geom_line()
+```
+
+### Preprocess Data for modeling
+
+We will subset 70% of data as training data, 30% of data as cross-validation data. 
+```{r partition, echo=TRUE, warning=FALSE}
+set.seed(3456)
+trainDS <- 
+    allDS %>% 
+    filter(!is.na(trip_duration)) %>%
+    filter(!is.na(trip_duration_computed))
+trainIndex <- createDataPartition(trainDS$trip_distance, p = .70, 
+                                  list = FALSE, 
+                                  times = 1)
+tripTrain <- trainDS[trainIndex, ]
+tripCV <- trainDS[-trainIndex,]
+dim(tripTrain)
+dim(tripCV)
+
+```
+
+## Regression Model
+
+### Initial linear model
+We fit a linear regression model first and check the residuals. It looks like there are some pattern around trip_distance between 0 to 50 KM. The group seem to be splitting to two. some in the high range (i.e. residuals around 20-25, some in lower range(residuals near 0)). It looks like we might be missing some variables or need to try a different model.
+
+```{r model_fit_linear, echo=TRUE}
+modelFit <- lm(data=tripTrain, trip_duration_computed ~ trip_distance +
+        factor(trip_hour) +
+        factor(trip_wkday_ind) +
+        factor(trip_pickup_cluster) +
+        factor(trip_month) +1)
+coef(modelFit)
+anova(modelFit)
+
+predictData <- predict(modelFit, newdata=tripCV)
+predictData <- as.data.frame(predictData)
+t.test(predictData, tripCV$trip_duration_computed)
+rmseInidialModel <- sqrt(1/nrow(tripCV) *
+ (sum((log2(predictData[,1]+1) - log2(tripCV$trip_duration_computed+1))^2)))
+residualsCV <- resid(modelFit)
+plot(x=tripTrain$trip_duration,  residualsCV)
+```
+
+### Residual Plot Diagnosis
+We will try split out the data between the dataset that has higher residuals and lower residuals and run different model. 
+We have 1894 rows that are having large residuals
+We want to know how do we know these rows are residuals, we will run the classification model to categorize the residual categories.
+
+```{r residual_diagnosis}
+quantile(modelFit$residuals)
+tripTrain$quantileRank <- 1
+for (i in 1:4)
+{
+    curRowIndex <- which(modelFit$resid <= quantile(modelFit$residuals)[[i+1]] &
+                             modelFit$resid > quantile(modelFit$residuals)[[i]])
+    
+    print(paste("Current range:", 
+                as.character(quantile(modelFit$residuals)[[i+1]]),
+                as.character(quantile(modelFit$residuals)[[i]])))
+    print(length(curRowIndex))
+    tripTrain[curRowIndex, "quantileRank"]  <- i  
+}
+
+rm(list="predictData")
+rm(modelFit)
+
+summary(tripTrain$quantileRank)
+```
+
+### Add Rush hour and trip distance feature
+From the above model, we can see that some categories of data are having high residuals. We run the rpart classification model to find what kind of categories will result in such high residuals.
+
+```{r rpart_model, echo=TRUE}
+results_model <- rpart(data=tripTrain,
+                          quantileRank ~ 
+                           trip_distance +
+                           as.factor(trip_hour) +
+                           factor(trip_wkday) +
+                           factor(trip_pickup_cluster) +
+                           factor(trip_month),
+                     method="class")
+print(results_model)    
+```
+
+It looks like the rush hour and trip distance has some
+effect on residuals, we will form a categorized trip_distance variable as a new feature. 
+
+```{r distance_rush_hour_cat, echo=TRUE}
+
+add_rushhour_ind <- function(tripTrain) 
+{
+    
+    tripTrain <- tripTrain %>%
+        mutate(trip_rush_hour = factor(ifelse(trip_hour %in% c(8:18), "R", "N"))) %>%
+        mutate(trip_distance_cat = 
+               factor(case_when(
+                   trip_distance < 1681.444 ~ 'DIST1',
+                   trip_distance >=1681.444 & trip_distance < 3025.273 ~ 'DIST2',
+                   trip_distance >= 3025.273 ~ 'DIST3'))) %>%
+        mutate(trip_cluster_cat = 
+                   paste(as.character(trip_pickup_cluster), 
+                         "_",
+                         as.character(trip_dropoff_cluster), sep=""))
+    tripTrain
+}
+
+tripTrain <- add_rushhour_ind(tripTrain)
+tripCV <- add_rushhour_ind(tripCV)
+```
+
+## Subset short distance and long distance data to choose different model
+
+We are wondering if short distance ride will have different outcome than long distance ride , since usually in short distance ride in down town the speed is much slower than long distance ride. We will subset the data according to the trip_distance. When plotting the predicted v.s. outcome duration, we found there are 219 rows that has large number of residues. When look at the data individually, we can see that the trip_duration is extremly unreasonable (nearly 24 hours for 5 KM ride). After drop the outliner, we can see the residuals dropped significantly from 0.9 to 0.65.
+
+```{r short_distance_cat , echo=TRUE}
+s1 <- subset(tripTrain, trip_distance_cat == 'DIST1')
+s2 <- subset(tripTrain, trip_distance_cat == 'DIST2')
+s3 <- subset(tripTrain, trip_distance_cat == 'DIST3')
+
+
+v1 <- subset(tripCV, trip_distance_cat == 'DIST1')
+v2 <- subset(tripCV, trip_distance_cat == 'DIST2')
+v3 <- subset(tripCV, trip_distance_cat == 'DIST3')
+
+make_xgb_matrix<- function(d)
+{
+    sparse_matrix <- sparse.model.matrix(trip_duration~
+                                             trip_distance+
+                                             trip_rush_hour+
+                                             factor(trip_cluster_cat), data = d)
+    output_vector <- d$trip_duration
+    ret <- xgb.DMatrix(data=sparse_matrix, label=output_vector)
+    ret
+}
+make_xgb_model_prediction <- function(s, v)
+{
+    print("Boosting..")
+    sparse_matrix_s <- make_xgb_matrix(s)
+    output_vector <- s$trip_duration
+    bst <- xgboost(data = sparse_matrix_s, label = output_vector, max_depth = 4,
+                   eta = 1, nthread = 2, nrounds = 10,
+                   eval.metric = "rmse", objective = "reg:linear")
+    output_vector <- s$trip_duration
+    foldsCV <- createFolds(output_vector, k=7, list=TRUE, returnTrain=FALSE)
+    
+    param <- list(colsample_bytree = 0.7
+                  , booster = "gbtree"
+                  , objective = "reg:linear"
+                  , subsample = 0.7
+                  , max_depth = 5
+                  , eta = 0.037
+                  , eval_metric = 'rmse'
+                  , base_score = 0.012 #average
+                  , seed = 4321)
+    
+    bst <- xgb.cv(data=sparse_matrix_s,
+                  params=param, 
+                  nrounds = 30,
+                  folds=foldsCV,label=output_vector,
+           prediction=TRUE, nthread = 2,
+            early_stopping_rounds = 15,print_every_n = 5)
+    
+    nrounds <- bst$best_iteration
+    
+    
+    print("training the xgb...")
+    xgb <- xgb.train(params = param
+                     , data = sparse_matrix_s
+                     , nrounds = nrounds
+                     , verbose = 1
+                     , print_every_n = 5
+                     #, feval = amm_mae
+                    )
+    
+    sparse_matrix_v <- make_xgb_matrix(v)
+    
+    print("Predict using the xgb boosting model...")
+    predictedxgb <- predict(xgb, sparse_matrix_v)
+    predictedxgb
+}
+make_linear_model <- function(s, v)
+{
+    print("Linear model ...")
+    split_model <- lm(data=s,
+                       trip_duration ~ 
+                           trip_distance +
+                           trip_rush_hour +
+                           factor(trip_pickup_cluster) + 
+                           1)
+    print("Prediction using the linear model ...")
+    predictv <- predict(split_model, newdata=v)
+    predictv
+}
+distance_model <- function(s, v)
+{
+    predictedxgb <- make_xgb_model_prediction(s, v)
+    xgbRmse <- rmsle(predictedxgb, v1$trip_duration)
+    predictedlinear <- make_linear_model(s,v)
+    linearRmse <- rmsle(predictedlinear, v$trip_duration)
+    print(paste("rmse pair:", as.character(xgbRmse), as.character(linearRmse)))
+    if (xgbRmse < linearRmse)
+        print("Choose xgb model!")
+    else
+        print("Choose linear model!")
+    
+}
+
+distance_model(s1, v1)
+distance_model(s2, v2)
+distance_model(s3, v3)
+rm(s1)
+rm(s2)
+rm(s3)
+gc()
+```
+### Final Kernel 
+For the test data, we will categorize the same DIST interval and choose xgb model for DIST1 (short distance), while using the linear model for DIST2 and DIST3.
+
+```{r final_kernel, echo=TRUE}
+allDS <- add_rushhour_ind(allDS)
+testDS <- allDS %>%
+    filter(is.na(dropoff_datetime))
+trainDS <- allDS %>%
+    filter(!is.na(dropoff_datetime))
+final_model <- function(testDS)
+{
+    testList <- list()
+    trainList <- list()
+    predictionList <- list()
+    final_prediction <- data.frame()
+    for (i in 1:3) 
+    {
+        print("A New iteration ")
+        trainList[[i]] <- subset(trainDS, 
+                    trip_distance_cat == paste('DIST', as.character(i), sep=""))
+        testList[[i]] <- subset(testDS, 
+                    trip_distance_cat == paste('DIST', as.character(i), sep=""))
+        ## reset to 0 to avoid error
+        testList[[i]]$trip_duration <- 0
+        if (i == 1)
+        {
+            predictionList[[i]] <- 
+                 make_xgb_model_prediction(trainList[[i]], testList[[i]])
+        }
+        else
+        {
+            predictionList[[i]]  <-
+                make_linear_model(trainList[[i]],testList[[i]])
+        }
+        # Construct a id <- prediction data frame
+        currResult <- as.data.frame(cbind(as.character(testList[[i]]$id), predictionList[[i]]))
+        final_prediction <- as.data.frame(
+            rbind(final_prediction, currResult))
+    }
+    final_prediction
+}
+final_prediction <- final_model(testDS)
+write.table(final_prediction, file="prediction_trip_duration.csv",sep=",",
+          col.names=c("id", "trip_duration"), row.names=FALSE,quote=FALSE)
+
+```
