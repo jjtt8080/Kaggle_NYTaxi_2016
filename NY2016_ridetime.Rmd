@@ -1,7 +1,7 @@
 ---
 title: "New York Taxi Ride Time Prediction"
-output: github_document
-    html_document
+output: html_document
+    
 ---
 
 ```{r setup, include=FALSE}
@@ -113,7 +113,7 @@ summary(allDS$trip_speed)
 ```
 
 ### Additional predictor for Pick up / drop off location 
-When dealing with the popular pickup location map <a href="https://jjtt8080.neocities.org/Data%20Science%20Projects/New%20York%20Taxi%202016/ny_taxi_popular_pickup.html">, we found there are some popular pick up location that's near suburb area like airport. Most of the pickup locations are near Mahattan. We wonder if those pickup/drop off location will affect the speed since the airport is usually off suburburn and the driving speed usually is greater. We will use kmeans to find the clustered pickup/drop off location and add two more additional column named pickup_cluster_id, dropoff_cluster_id as additional predictors.
+When dealing with the popular pickup location  <a href="https://jjtt8080.neocities.org/Data%20Science%20Projects/New%20York%20Taxi%202016/ny_taxi_popular_pickup.html"/>map</a> , we found there are some popular pick up location that's near suburb area like airport. Most of the pickup locations are near Mahattan. We wonder if those pickup/drop off location will affect the speed since the airport is usually off suburburn and the driving speed usually is greater. We will use kmeans to find the clustered pickup/drop off location and add two more additional column named pickup_cluster_id, dropoff_cluster_id as additional predictors.
 
 ```{r pickup_dropoff_center}
 set.seed(7553)
